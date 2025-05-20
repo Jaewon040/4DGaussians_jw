@@ -127,6 +127,27 @@ class GaussianModel:
     def get_opacity(self):
         return self.opacity_activation(self._opacity)
     
+
+    def freeze_deformation(self):
+        """
+        Freeze the deformation network
+        """
+        self._deformation.freeze_parameters()
+        
+    def unfreeze_deformation(self):
+        """
+        Unfreeze the deformation network
+        """
+        self._deformation.unfreeze_parameters()
+        
+    def is_deformation_frozen(self):
+        """
+        Check if deformation network is frozen
+        """
+        return self._deformation.is_parameters_frozen()
+
+
+
     def get_covariance(self, scaling_modifier = 1):
         return self.covariance_activation(self.get_scaling, scaling_modifier, self._rotation)
 

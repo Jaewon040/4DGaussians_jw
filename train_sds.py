@@ -31,6 +31,8 @@ from utils.scene_utils import render_training_image
 from time import time
 import copy
 
+from utils.sds_loss import StableDiffusionSDS
+
 to8b = lambda x : (255*np.clip(x.cpu().numpy(),0,1)).astype(np.uint8)
 
 try:
@@ -73,6 +75,20 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
     video_cams = scene.getVideoCameras()
     test_cams = scene.getTestCameras()
     train_cams = scene.getTrainCameras()
+
+
+    # SDS Loss 초기화 (opt.use_sds가 True인 경우에만)
+    sds_loss_fn = None
+    if opt.use_sds:
+        print("Initializing Stable Diffusion for SDS Loss...")
+        sds_loss_fn = StableDiffusionSDS(
+            sd_version='runwayml/stable-diffusion-v1-5',
+            guidance_scale=7.5,
+            min_step_percent=0.02,
+            max_step_percent=0.98
+        )
+    cycle_counter = 0
+    current_iter_uses_sds = False
 
 
     if not viewpoint_stack and not opt.dataloader:
@@ -136,6 +152,24 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
         iter_start.record()
 
         gaussians.update_learning_rate(iteration)
+
+        # 5000 iteration 이후에 3회 주기로 deformation 및 SDS 적용 여부 결정
+        if opt.use_sds and iteration >= opt.sds_start_iter:
+            # 3회 주기 중 첫 번째에만 deform freeze 및 SDS 사용
+            if cycle_counter % 3 == 0:
+                if not gaussians.is_deformation_frozen():
+                    print(f"\n[ITER {iteration}] Freezing deformation network and using SDS")
+                    gaussians.freeze_deformation()
+                    current_iter_uses_sds = True
+            else:
+                if gaussians.is_deformation_frozen():
+                    print(f"\n[ITER {iteration}] Unfreezing deformation network and not using SDS")
+                    gaussians.unfreeze_deformation()
+                    current_iter_uses_sds = False
+            
+            # 매 iteration마다 cycle_counter 증가
+            cycle_counter += 1
+
 
         # Every 1000 its we increase the levels of SH up to a maximum degree
         if iteration % 1000 == 0:
@@ -216,6 +250,33 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
         #     lpipsloss = lpips_loss(image_tensor,gt_image_tensor,lpips_model)
         #     loss += opt.lambda_lpips * lpipsloss
         
+
+        if sds_loss_fn is not None and current_iter_uses_sds:
+            # 렌더링된 이미지 형태 확인 및 필요시 크기 조정
+            rendered_image = image_tensor.clone()
+            
+            # 일반적으로 SD는 512x512 또는 768x768 이미지를 사용
+            # 필요시 리사이즈
+            orig_size = rendered_image.shape[-2:]
+            if orig_size != (512, 512):
+                rendered_image = F.interpolate(rendered_image, size=(512, 512), mode='bilinear', align_corners=False)
+            
+            # 객체에 맞는 적절한 프롬프트 설정
+            prompt = "A high quality 3D model"  # 객체에 맞게 수정 필요
+            negative_prompt = "low quality, blurry, distorted"
+            
+            # SDS loss 계산
+            sds_weight = 0.1  # SDS loss 가중치 (필요에 따라 조정)
+            sds_loss = sds_loss_fn(rendered_image, prompt, negative_prompt)
+
+            loss = loss + sds_weight * sds_loss
+            
+            if tb_writer:
+                tb_writer.add_scalar(f'{stage}/train_loss_patches/sds_loss', sds_loss.item(), iteration)
+  
+
+
+
         loss.backward()
         if torch.isnan(loss).any():
             print("loss is nan,end training, reexecv program now.")
@@ -419,6 +480,14 @@ if __name__ == "__main__":
         config = mmcv.Config.fromfile(args.configs)
         args = merge_hparams(args, config)
     print("Optimizing " + args.model_path)
+
+    # SDS 사용 여부 로그
+    if args.use_sds:
+        print(f"Using SDS Loss from iteration {args.sds_start_iter} with weight {args.sds_weight}")
+        print(f"SDS Prompt: '{args.sds_prompt}'")
+        print(f"SDS Negative Prompt: '{args.sds_negative_prompt}'")
+        print(f"SDS Cycle Ratio: {args.sds_cycle_ratio} (1 out of {args.sds_cycle_ratio} iterations)")
+    
 
     # Initialize system state (RNG)
     safe_state(args.quiet)

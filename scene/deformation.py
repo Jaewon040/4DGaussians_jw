@@ -180,7 +180,46 @@ class deform_network(nn.Module):
         self.register_buffer('rotation_scaling_poc', torch.FloatTensor([(2**i) for i in range(scale_rotation_pe)]))
         self.register_buffer('opacity_poc', torch.FloatTensor([(2**i) for i in range(opacity_pe)]))
         self.apply(initialize_weights)
+        # 학습 상태를 추적할 변수 추가
+        self.is_frozen = False
         # print(self)
+    
+    ##############################################
+    # 파라미터 freeze 메소드 추가
+    def freeze_parameters(self):
+        """
+        Freeze all parameters of the deformation network
+        """
+        if not self.is_frozen:
+            print("Freezing deformation network parameters...")
+            # MLP 파라미터와 Grid 파라미터 모두 freeze
+            for param in self.get_mlp_parameters():
+                param.requires_grad = False
+            for param in self.get_grid_parameters():
+                param.requires_grad = False
+            self.is_frozen = True
+
+    # 파라미터를 unfreeze하는 메소드 추가
+    def unfreeze_parameters(self):
+        """
+        Unfreeze all parameters of the deformation network
+        """
+        if self.is_frozen:
+            print("Unfreezing deformation network parameters...")
+            # MLP 파라미터와 Grid 파라미터 모두 unfreeze
+            for param in self.get_mlp_parameters():
+                param.requires_grad = True
+            for param in self.get_grid_parameters():
+                param.requires_grad = True
+            self.is_frozen = False
+            
+    def is_parameters_frozen(self):
+        """
+        Check if parameters are frozen
+        """
+        return self.is_frozen
+
+    ##############################################
 
     def forward(self, point, scales=None, rotations=None, opacity=None, shs=None, times_sel=None):
         return self.forward_dynamic(point, scales, rotations, opacity, shs, times_sel)

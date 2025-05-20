@@ -147,6 +147,15 @@ class OptimizationParams(ParamGroup):
         self.opacity_threshold_fine_after = 0.005
         self.batch_size=1
         self.add_point=False
+
+        self.use_sds = False         # SDS 사용 여부
+        self.sds_weight = 0.1        # SDS 손실 가중치
+        self.sds_start_iter = 5000   # SDS 시작 iteration
+        self.sds_prompt = "A high quality 3D model"  # 기본 프롬프트
+        self.sds_negative_prompt = "low quality, blurry, distorted"  # 기본 부정 프롬프트
+        self.sds_cycle_ratio = 3     # 몇 번의 iteration마다 한 번 SDS를 사용할지
+        
+
         super().__init__(parser, "Optimization Parameters")
 
 def get_combined_args(parser : ArgumentParser):
