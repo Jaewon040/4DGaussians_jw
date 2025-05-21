@@ -104,6 +104,7 @@ if __name__ == "__main__":
     parser.add_argument("--configs", type=str)
     args = get_combined_args(parser)
     print("Rendering " , args.model_path)
+
     if args.configs:
         import mmcv
         from utils.params_utils import merge_hparams

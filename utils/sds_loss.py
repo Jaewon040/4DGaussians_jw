@@ -128,6 +128,8 @@ class StableDiffusionSDS(nn.Module):
         
         return torch.cat(latents_list, dim=0)
     
+    
+    # Modified StableDiffusionSDS.forward method to handle dtype mismatches
     def forward(
         self,
         rendered_images: torch.Tensor,
@@ -136,75 +138,57 @@ class StableDiffusionSDS(nn.Module):
         guidance_scale: Optional[float] = None,
         t_range: Optional[Tuple[float, float]] = None,
     ) -> torch.Tensor:
-        """
-        렌더링된 이미지에 대한 SDS 손실 계산
-        
-        Args:
-            rendered_images: [B, 3, H, W] 범위 [0, 1]의 렌더링된 이미지
-            prompt: 텍스트 프롬프트 (단일 문자열 또는 문자열 리스트)
-            negative_prompt: 부정적인 프롬프트
-            guidance_scale: classifier-free guidance 강도 (지정되지 않으면 기본값 사용)
-            t_range: 타임스텝 범위 (min, max), 지정되지 않으면 기본값 사용
-            
-        Returns:
-            SDS 손실값
-        """
         batch_size = rendered_images.shape[0]
         
-        # 이미지가 올바른 범위인지 확인하고 필요시 수정
+        # Ensure images are in the correct range and dtype
         if rendered_images.min() < 0 or rendered_images.max() > 1:
-            print(f"경고: 입력 이미지 범위가 [0, 1]를 벗어납니다. 최소값: {rendered_images.min()}, 최대값: {rendered_images.max()}")
+            print(f"Warning: Input image range outside [0, 1]. Min: {rendered_images.min()}, Max: {rendered_images.max()}")
             rendered_images = torch.clamp(rendered_images, 0.0, 1.0)
             
-        # 이미지를 [-1, 1] 범위로 변환 (SD 모델에 맞게)
-        rendered_images = 2 * rendered_images - 1
+        # Convert to float16 to match model's dtype requirements
+        rendered_images_fp16 = rendered_images.to(torch.float16)
         
-        # 텍스트 임베딩 계산 - 중요 수정: 각 이미지마다 별도의 프롬프트 설정
+        # Scale to [-1, 1] range for SD model
+        rendered_images_fp16 = 2 * rendered_images_fp16 - 1
+        
+        # Process prompts
         prompt_list = [prompt] * batch_size if isinstance(prompt, str) else prompt
         neg_prompt_list = [negative_prompt] * batch_size if isinstance(negative_prompt, str) else negative_prompt
         
-        # 각 이미지마다 개별적으로 처리
         total_loss = 0.0
         
         for i in range(batch_size):
-            # 단일 이미지 처리 (배치 크기 1)
-            single_image = rendered_images[i:i+1]
+            # Process single image
+            single_image = rendered_images_fp16[i:i+1]
             single_prompt = prompt_list[i] if i < len(prompt_list) else prompt_list[0]
             single_neg_prompt = neg_prompt_list[i] if i < len(neg_prompt_list) else neg_prompt_list[0]
             
-            # 텍스트 임베딩 계산
+            # Get text embeddings
             text_embeddings = self.get_text_embeddings(single_prompt, single_neg_prompt)
             
-            # 이미지를 잠재 공간으로 인코딩
+            # Encode image to latent space
             with torch.no_grad():
                 image_latents = self.encode_images(single_image)
                 
-            # 타임스텝 범위 (지정된 경우 사용)
+            # Sample timestep
             min_step = int((t_range[0] if t_range else self.min_step_percent) * self.num_train_timesteps)
             max_step = int((t_range[1] if t_range else self.max_step_percent) * self.num_train_timesteps)
             
-            # 랜덤 타임스텝 샘플링
-            t = torch.randint(
-                min_step, 
-                max_step, 
-                (1,),  # 배치 크기 1
-                device=self.device
-            )
+            t = torch.randint(min_step, max_step, (1,), device=self.device)
             
-            # 노이즈 샘플링
+            # Sample noise
             noise = torch.randn_like(image_latents)
             
-            # 노이즈 추가 (forward diffusion)
-            alphas = self.sd_pipeline.scheduler.alphas_cumprod.to(self.device)
+            # Add noise (forward diffusion)
+            alphas = self.sd_pipeline.scheduler.alphas_cumprod.to(self.device).to(image_latents.dtype)
             alphas_t = alphas[t]
             sqrt_alphas_t = torch.sqrt(alphas_t).view(-1, 1, 1, 1)
             sqrt_one_minus_alphas_t = torch.sqrt(1 - alphas_t).view(-1, 1, 1, 1)
             
             noisy_latents = sqrt_alphas_t * image_latents + sqrt_one_minus_alphas_t * noise
             
-            # U-Net으로 노이즈 예측
+            # Predict noise with U-Net
             with torch.no_grad():
-                # Classifier-free guidance용 확장
                 latent_model_input = torch.cat([noisy_latents] * 2)
                 noise_pred = self.sd_pipeline.unet(
                     latent_model_input,
@@ -212,18 +196,20 @@ class StableDiffusionSDS(nn.Module):
                     encoder_hidden_states=text_embeddings
                 ).sample
                 
-                # noise_pred에서 실제 guidance 적용
+                # Apply guidance
                 noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
                 g_scale = guidance_scale or self.guidance_scale
                 noise_pred = noise_pred_uncond + g_scale * (noise_pred_text - noise_pred_uncond)
             
-            # SDS gradient 계산
+            # Calculate SDS gradient
             w = (1 - alphas_t).view(-1, 1, 1, 1)
             grad = w * (noise_pred - noise)
             
-            # SD 모델에 기반한 SDS loss 계산
-            single_loss = torch.nn.functional.mse_loss(grad, torch.zeros_like(grad), reduction='mean')
+            # SDS loss calculation - make sure everything is same dtype
+            zero_target = torch.zeros_like(grad, dtype=grad.dtype, device=grad.device)
+            single_loss = torch.nn.functional.mse_loss(grad, zero_target, reduction='mean')
             total_loss += single_loss
         
-        # 배치 전체에 대한 평균 loss 반환
-        return total_loss / batch_size
+        # Return the average loss with proper dtype conversion
+        # Convert back to float32 for the rest of the training
+        return (total_loss / batch_size).to(torch.float32)

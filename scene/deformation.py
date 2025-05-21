@@ -191,7 +191,7 @@ class deform_network(nn.Module):
         Freeze all parameters of the deformation network
         """
         if not self.is_frozen:
-            print("Freezing deformation network parameters...")
+            # print("Freezing deformation network parameters...")
             # MLP 파라미터와 Grid 파라미터 모두 freeze
             for param in self.get_mlp_parameters():
                 param.requires_grad = False
@@ -205,7 +205,7 @@ class deform_network(nn.Module):
         Unfreeze all parameters of the deformation network
         """
         if self.is_frozen:
-            print("Unfreezing deformation network parameters...")
+            # print("Unfreezing deformation network parameters...")
             # MLP 파라미터와 Grid 파라미터 모두 unfreeze
             for param in self.get_mlp_parameters():
                 param.requires_grad = True

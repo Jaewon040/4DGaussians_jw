@@ -160,12 +160,12 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
             # 3회 주기 중 첫 번째에만 deform freeze 및 SDS 사용
             if cycle_counter % 3 == 0:
                 if not gaussians.is_deformation_frozen():
-                    print(f"\n[ITER {iteration}] Freezing deformation network and using SDS")
+                    # print(f"\n[ITER {iteration}] Freezing deformation network and using SDS")
                     gaussians.freeze_deformation()
                     current_iter_uses_sds = True
             else:
                 if gaussians.is_deformation_frozen():
-                    print(f"\n[ITER {iteration}] Unfreezing deformation network and not using SDS")
+                    # print(f"\n[ITER {iteration}] Unfreezing deformation network and not using SDS")
                     gaussians.unfreeze_deformation()
                     current_iter_uses_sds = False
             
@@ -291,7 +291,7 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
                     rendered_image = F.interpolate(rendered_image, size=(512, 512), mode='bilinear', align_corners=False)
                 
                 # 배치 처리를 위한 준비
-                print(f"SDS 계산을 위한 이미지 배치 크기: {rendered_image.shape[0]}")
+                # print(f"SDS 계산을 위한 이미지 배치 크기: {rendered_image.shape[0]}")
                 
                 # SD 모델에서 기대하는 프롬프트 형식 준비
                 # 각 이미지마다 동일한 프롬프트 사용
