@@ -240,24 +240,57 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
         # norm
         
 
-        loss = Ll1
+        loss_recon = Ll1
         if stage == "fine" and hyper.time_smoothness_weight != 0:
             # tv_loss = 0
             tv_loss = gaussians.compute_regulation(hyper.time_smoothness_weight, hyper.l1_time_planes, hyper.plane_tv_weight)
-            loss += tv_loss
+            loss_recon += tv_loss
         if opt.lambda_dssim != 0:
             ssim_loss = ssim(image_tensor,gt_image_tensor)
-            loss += opt.lambda_dssim * (1.0-ssim_loss)
+            loss_recon += opt.lambda_dssim * (1.0-ssim_loss)
         # if opt.lambda_lpips !=0:
         #     lpipsloss = lpips_loss(image_tensor,gt_image_tensor,lpips_model)
-        #     loss += opt.lambda_lpips * lpipsloss
-        
-
+        #     loss_recon += opt.lambda_lpips * lpipsloss
+                
+        loss_sds = None
         # SDS Loss 추가 (sds_loss_fn이 초기화되어 있고 현재 iteration이 SDS를 사용하는 경우에만)
         # SDS Loss 추가 (sds_loss_fn이 초기화되어 있고 현재 iteration이 SDS를 사용하는 경우에만)
         if sds_loss_fn is not None and current_iter_uses_sds:
             try:
                 # Canonical 렌더링 (변형 없이 원래 상태의 Gaussians만 렌더링)
+                    # Canonical 렌더링 결과 저장 (1000 iteration마다)
+                if iteration % 1000 == 0:
+                    print(f"\n[ITER {iteration}] Saving canonical SDS samples for all cameras...")
+                    canonical_save_path = os.path.join(scene.model_path, "canonical_sds_samples", f"iter_{iteration}")
+                    
+                    # Train 카메라 전체에 대한 canonical 렌더링
+                    train_render_path = os.path.join(canonical_save_path, "train")
+                    os.makedirs(train_render_path, exist_ok=True)
+                    
+                    for idx, train_cam in enumerate(train_cams):
+                        canonical_render = render(train_cam, gaussians, pipe, background, 
+                                                stage=stage, cam_type=scene.dataset_type, canonical=True)["render"]
+                        canonical_render = torch.clamp(canonical_render, 0.0, 1.0)
+                        torchvision.utils.save_image(
+                            canonical_render, 
+                            os.path.join(train_render_path, f"train_{idx:05d}.png")
+                        )
+                    
+                    # Test 카메라 전체에 대한 canonical 렌더링
+                    test_render_path = os.path.join(canonical_save_path, "test")
+                    os.makedirs(test_render_path, exist_ok=True)
+                    
+                    for idx, test_cam in enumerate(test_cams):
+                        canonical_render = render(test_cam, gaussians, pipe, background, 
+                                                stage=stage, cam_type=scene.dataset_type, canonical=True)["render"]
+                        canonical_render = torch.clamp(canonical_render, 0.0, 1.0)
+                        torchvision.utils.save_image(
+                            canonical_render, 
+                            os.path.join(test_render_path, f"test_{idx:05d}.png")
+                        )
+                    
+                    print(f"Saved {len(train_cams)} train and {len(test_cams)} test canonical renders")
+                
                 canonical_results = []
                 for viewpoint_cam in viewpoint_cams:
                     # canonical=True로 설정하여 deformation 미적용 렌더링
@@ -268,15 +301,15 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
                 
                 canonical_image_tensor = torch.cat(canonical_results, 0)
                 
-                # Canonical 렌더링 결과 저장 (1000 iteration마다)
-                if iteration % 1000 == 0:
-                    canonical_save_path = os.path.join(scene.model_path, "canonical_sds_samples", f"iter_{iteration}")
-                    os.makedirs(canonical_save_path, exist_ok=True)
-                    for idx, img in enumerate(canonical_results):
-                        torchvision.utils.save_image(
-                            img, 
-                            os.path.join(canonical_save_path, f"cam_{idx}.png")
-                        )
+                # # Canonical 렌더링 결과 저장 (1000 iteration마다)
+                # if iteration % 1000 == 0:
+                #     canonical_save_path = os.path.join(scene.model_path, "canonical_sds_samples", f"iter_{iteration}")
+                #     os.makedirs(canonical_save_path, exist_ok=True)
+                #     for idx, img in enumerate(canonical_results):
+                #         torchvision.utils.save_image(
+                #             img, 
+                #             os.path.join(canonical_save_path, f"cam_{idx}.png")
+                #         )
                 
                 # 렌더링된 이미지 형태 확인 및 필요시 크기 조정
                 rendered_image = canonical_image_tensor.clone()
@@ -304,7 +337,7 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
                     prompts,  # 배치의 각 이미지에 대한 프롬프트 리스트 전달
                     negative_prompts  # 배치의 각 이미지에 대한 부정 프롬프트 리스트 전달
                 )
-                loss = loss + opt.sds_weight * sds_loss
+                loss_sds = opt.sds_weight * sds_loss
                 
                 # Tensorboard에 SDS loss 로깅
                 if tb_writer:
@@ -314,9 +347,17 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
                 print(f"SDS Loss 계산 중 오류 발생: {e}")
                 print(f"렌더링 이미지 범위: 최소={rendered_image.min()}, 최대={rendered_image.max()}")
                 print(f"렌더링 이미지 크기: {rendered_image.shape}")
+                loss_sds = None
                 # 오류가 발생해도 학습은 계속 진행
                 pass
-
+        if current_iter_uses_sds:
+            # SDS iteration에서는 reconstruction loss 비중 줄이기
+            loss = loss_sds
+            current_loss_type = "SDS"
+        else:
+            # 일반 iteration에서는 reconstruction만
+            loss = loss_recon
+            current_loss_type = "Recon"
 
         loss.backward()
         if torch.isnan(loss).any():
@@ -333,9 +374,18 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
             ema_psnr_for_log = 0.4 * psnr_ + 0.6 * ema_psnr_for_log
             total_point = gaussians._xyz.shape[0]
             if iteration % 10 == 0:
-                progress_bar.set_postfix({"Loss": f"{ema_loss_for_log:.{7}f}",
-                                          "psnr": f"{psnr_:.{2}f}",
-                                          "point":f"{total_point}"})
+                # 기존 progress_bar.set_postfix에 SDS 손실값 추가
+                postfix_dict = {
+                    "Loss": f"{ema_loss_for_log:.{7}f}",
+                    "psnr": f"{psnr_:.{2}f}",
+                    "point": f"{total_point}",
+                    "SDS": f"{loss_sds.item() if loss_sds is not None else 0:.{6}f}",  # ← 조건 없이 그냥 표시
+                    "Recon": f"{loss_recon.item():.{5}f}",   # ← 조건 없이 그냥 표시
+                    "Type": current_loss_type
+                }
+
+                        
+                progress_bar.set_postfix(postfix_dict)
                 progress_bar.update(10)
             if iteration == opt.iterations:
                 progress_bar.close()

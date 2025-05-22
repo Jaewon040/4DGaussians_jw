@@ -31,6 +31,10 @@ from utils.scene_utils import render_training_image
 from time import time
 import copy
 
+from utils.sds_loss import StableDiffusionSDS
+import torch.nn.functional as F
+import torchvision
+
 to8b = lambda x : (255*np.clip(x.cpu().numpy(),0,1)).astype(np.uint8)
 
 try:
@@ -73,6 +77,20 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
     video_cams = scene.getVideoCameras()
     test_cams = scene.getTestCameras()
     train_cams = scene.getTrainCameras()
+
+
+    # SDS Loss 초기화 (opt.use_sds가 True인 경우에만)
+    sds_loss_fn = None
+    if opt.use_sds:
+        print("Initializing Stable Diffusion for SDS Loss...")
+        sds_loss_fn = StableDiffusionSDS(
+            sd_version='runwayml/stable-diffusion-v1-5',
+            guidance_scale=7.5,
+            min_step_percent=0.02,
+            max_step_percent=0.98
+        )
+    cycle_counter = 0
+    current_iter_uses_sds = False
 
 
     if not viewpoint_stack and not opt.dataloader:
@@ -136,6 +154,24 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
         iter_start.record()
 
         gaussians.update_learning_rate(iteration)
+
+        # 5000 iteration 이후에 3회 주기로 deformation 및 SDS 적용 여부 결정
+        if opt.use_sds and iteration >= opt.sds_start_iter:
+            # 3회 주기 중 첫 번째에만 deform freeze 및 SDS 사용
+            if cycle_counter % 3 == 0:
+                if not gaussians.is_deformation_frozen():
+                    # print(f"\n[ITER {iteration}] Freezing deformation network and using SDS")
+                    gaussians.freeze_deformation()
+                    current_iter_uses_sds = True
+            else:
+                if gaussians.is_deformation_frozen():
+                    # print(f"\n[ITER {iteration}] Unfreezing deformation network and not using SDS")
+                    gaussians.unfreeze_deformation()
+                    current_iter_uses_sds = False
+            
+            # 매 iteration마다 cycle_counter 증가
+            cycle_counter += 1
+
 
         # Every 1000 its we increase the levels of SH up to a maximum degree
         if iteration % 1000 == 0:
@@ -216,6 +252,72 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
         #     lpipsloss = lpips_loss(image_tensor,gt_image_tensor,lpips_model)
         #     loss += opt.lambda_lpips * lpipsloss
         
+
+        # SDS Loss 추가 (sds_loss_fn이 초기화되어 있고 현재 iteration이 SDS를 사용하는 경우에만)
+        # SDS Loss 추가 (sds_loss_fn이 초기화되어 있고 현재 iteration이 SDS를 사용하는 경우에만)
+        if sds_loss_fn is not None and current_iter_uses_sds:
+            try:
+                # Canonical 렌더링 (변형 없이 원래 상태의 Gaussians만 렌더링)
+                canonical_results = []
+                for viewpoint_cam in viewpoint_cams:
+                    # canonical=True로 설정하여 deformation 미적용 렌더링
+                    canonical_render = render(viewpoint_cam, gaussians, pipe, background, stage=stage, cam_type=scene.dataset_type, canonical=True)["render"]
+                    # 중요: 이미지를 [0, 1] 범위로 클램핑
+                    canonical_render = torch.clamp(canonical_render, 0.0, 1.0)
+                    canonical_results.append(canonical_render.unsqueeze(0))
+                
+                canonical_image_tensor = torch.cat(canonical_results, 0)
+                
+                # Canonical 렌더링 결과 저장 (1000 iteration마다)
+                if iteration % 1000 == 0:
+                    canonical_save_path = os.path.join(scene.model_path, "canonical_sds_samples", f"iter_{iteration}")
+                    os.makedirs(canonical_save_path, exist_ok=True)
+                    for idx, img in enumerate(canonical_results):
+                        torchvision.utils.save_image(
+                            img, 
+                            os.path.join(canonical_save_path, f"cam_{idx}.png")
+                        )
+                
+                # 렌더링된 이미지 형태 확인 및 필요시 크기 조정
+                rendered_image = canonical_image_tensor.clone()
+                
+                # 다시 한번 [0, 1] 범위로 클램핑 (안전을 위해)
+                rendered_image = torch.clamp(rendered_image, 0.0, 1.0)
+                
+                # 일반적으로 SD는 512x512 또는 768x768 이미지를 사용
+                # 필요시 리사이즈
+                orig_size = rendered_image.shape[-2:]
+                if orig_size != (512, 512):
+                    rendered_image = F.interpolate(rendered_image, size=(512, 512), mode='bilinear', align_corners=False)
+                
+                # 배치 처리를 위한 준비
+                # print(f"SDS 계산을 위한 이미지 배치 크기: {rendered_image.shape[0]}")
+                
+                # SD 모델에서 기대하는 프롬프트 형식 준비
+                # 각 이미지마다 동일한 프롬프트 사용
+                prompts = [opt.sds_prompt] * rendered_image.shape[0]
+                negative_prompts = [opt.sds_negative_prompt] * rendered_image.shape[0]
+                
+                # SDS loss 계산
+                sds_loss = sds_loss_fn(
+                    rendered_image, 
+                    prompts,  # 배치의 각 이미지에 대한 프롬프트 리스트 전달
+                    negative_prompts  # 배치의 각 이미지에 대한 부정 프롬프트 리스트 전달
+                )
+                loss = loss + opt.sds_weight * sds_loss
+                
+                # Tensorboard에 SDS loss 로깅
+                if tb_writer:
+                    tb_writer.add_scalar(f'{stage}/train_loss_patches/sds_loss', sds_loss.item(), iteration)
+            
+            except Exception as e:
+                print(f"SDS Loss 계산 중 오류 발생: {e}")
+                print(f"렌더링 이미지 범위: 최소={rendered_image.min()}, 최대={rendered_image.max()}")
+                print(f"렌더링 이미지 크기: {rendered_image.shape}")
+                # 오류가 발생해도 학습은 계속 진행
+                pass
+
+
         loss.backward()
         if torch.isnan(loss).any():
             print("loss is nan,end training, reexecv program now.")
@@ -231,12 +333,70 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
             ema_psnr_for_log = 0.4 * psnr_ + 0.6 * ema_psnr_for_log
             total_point = gaussians._xyz.shape[0]
             if iteration % 10 == 0:
-                progress_bar.set_postfix({"Loss": f"{ema_loss_for_log:.{7}f}",
-                                          "psnr": f"{psnr_:.{2}f}",
-                                          "point":f"{total_point}"})
+                # 기존 progress_bar.set_postfix에 SDS 손실값 추가
+                postfix_dict = {
+                    "Loss": f"{ema_loss_for_log:.{7}f}",
+                    "psnr": f"{psnr_:.{2}f}",
+                    "point": f"{total_point}"
+                }
+                
+                # SDS가 활성화된 경우에만 SDS 손실값 추가
+                if sds_loss_fn is not None and current_iter_uses_sds:
+                    try:
+                        postfix_dict["SDS"] = f"{sds_loss.item():.{5}f}"
+                    except:
+                        pass
+                        
+                progress_bar.set_postfix(postfix_dict)
                 progress_bar.update(10)
             if iteration == opt.iterations:
                 progress_bar.close()
+
+
+            # 주기적으로 canonical Gaussians 렌더링 추가
+            # 3000, 5000, 10000, 15000... 등 주요 iteration에서 렌더링
+            if iteration in [3000, 5000, 10000, 15000, 20000, 25000, 30000]:
+                print(f"\n[ITER {iteration}] Rendering canonical Gaussians...")
+                canonical_render_dir = os.path.join(scene.model_path, "canonical", f"iter_{iteration}")
+                os.makedirs(canonical_render_dir, exist_ok=True)
+                
+                # 몇 개의 샘플 카메라만 선택하여 렌더링 (모든 카메라 렌더링은 시간이 많이 소요됨)
+                sample_train_cams = [train_cams[i] for i in range(0, len(train_cams), max(1, len(train_cams) // 5))][:5]
+                sample_test_cams = [test_cams[i] for i in range(0, len(test_cams), max(1, len(test_cams) // 5))][:5]
+                
+                # 훈련 카메라에 대한 렌더링
+                train_renders = []
+                train_render_path = os.path.join(canonical_render_dir, "train")
+                os.makedirs(train_render_path, exist_ok=True)
+                
+                for idx, cam in enumerate(sample_train_cams):
+                    rendering = render(cam, gaussians, pipe, background, stage=stage, cam_type=scene.dataset_type, canonical=True)["render"]
+                    train_renders.append(to8b(rendering).transpose(1, 2, 0))
+                    torchvision.utils.save_image(rendering, os.path.join(train_render_path, f"train_{idx}.png"))
+                
+                # 테스트 카메라에 대한 렌더링
+                test_renders = []
+                test_render_path = os.path.join(canonical_render_dir, "test")
+                os.makedirs(test_render_path, exist_ok=True)
+                
+                for idx, cam in enumerate(sample_test_cams):
+                    rendering = render(cam, gaussians, pipe, background, stage=stage, cam_type=scene.dataset_type, canonical=True)["render"]
+                    test_renders.append(to8b(rendering).transpose(1, 2, 0))
+                    torchvision.utils.save_image(rendering, os.path.join(test_render_path, f"test_{idx}.png"))
+                    
+                # 렌더링 결과를 Tensorboard에 로깅
+                if tb_writer:
+                    for idx, img in enumerate(train_renders[:2]):  # 처음 두 개만 로깅
+                        tb_img = torch.from_numpy(img.transpose(2, 0, 1) / 255.0).float()
+                        tb_writer.add_image(f'{stage}/canonical/train_{idx}', tb_img, global_step=iteration)
+                        
+                    for idx, img in enumerate(test_renders[:2]):  # 처음 두 개만 로깅
+                        tb_img = torch.from_numpy(img.transpose(2, 0, 1) / 255.0).float()
+                        tb_writer.add_image(f'{stage}/canonical/test_{idx}', tb_img, global_step=iteration)
+                
+                print(f"Canonical rendering at iteration {iteration} complete!")
+
+
 
             # Log and save
             timer.pause()
@@ -419,6 +579,14 @@ if __name__ == "__main__":
         config = mmcv.Config.fromfile(args.configs)
         args = merge_hparams(args, config)
     print("Optimizing " + args.model_path)
+
+    # SDS 사용 여부 로그
+    if args.use_sds:
+        print(f"Using SDS Loss from iteration {args.sds_start_iter} with weight {args.sds_weight}")
+        print(f"SDS Prompt: '{args.sds_prompt}'")
+        print(f"SDS Negative Prompt: '{args.sds_negative_prompt}'")
+        print(f"SDS Cycle Ratio: {args.sds_cycle_ratio} (1 out of {args.sds_cycle_ratio} iterations)")
+    
 
     # Initialize system state (RNG)
     safe_state(args.quiet)
