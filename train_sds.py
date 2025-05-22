@@ -255,61 +255,29 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
         loss_sds = None
         # SDS Loss 추가 (sds_loss_fn이 초기화되어 있고 현재 iteration이 SDS를 사용하는 경우에만)
         # SDS Loss 추가 (sds_loss_fn이 초기화되어 있고 현재 iteration이 SDS를 사용하는 경우에만)
+        # train_sds.py의 SDS 계산 부분 수정
+
         if sds_loss_fn is not None and current_iter_uses_sds:
             try:
                 # Canonical 렌더링 (변형 없이 원래 상태의 Gaussians만 렌더링)
-                    # Canonical 렌더링 결과 저장 (1000 iteration마다)
-                if iteration % 1000 == 0:
-                    print(f"\n[ITER {iteration}] Saving canonical SDS samples for all cameras...")
-                    canonical_save_path = os.path.join(scene.model_path, "canonical_sds_samples", f"iter_{iteration}")
-                    
-                    # Train 카메라 전체에 대한 canonical 렌더링
-                    train_render_path = os.path.join(canonical_save_path, "train")
-                    os.makedirs(train_render_path, exist_ok=True)
-                    
-                    for idx, train_cam in enumerate(train_cams):
-                        canonical_render = render(train_cam, gaussians, pipe, background, 
-                                                stage=stage, cam_type=scene.dataset_type, canonical=True)["render"]
-                        canonical_render = torch.clamp(canonical_render, 0.0, 1.0)
-                        torchvision.utils.save_image(
-                            canonical_render, 
-                            os.path.join(train_render_path, f"train_{idx:05d}.png")
-                        )
-                    
-                    # Test 카메라 전체에 대한 canonical 렌더링
-                    test_render_path = os.path.join(canonical_save_path, "test")
-                    os.makedirs(test_render_path, exist_ok=True)
-                    
-                    for idx, test_cam in enumerate(test_cams):
-                        canonical_render = render(test_cam, gaussians, pipe, background, 
-                                                stage=stage, cam_type=scene.dataset_type, canonical=True)["render"]
-                        canonical_render = torch.clamp(canonical_render, 0.0, 1.0)
-                        torchvision.utils.save_image(
-                            canonical_render, 
-                            os.path.join(test_render_path, f"test_{idx:05d}.png")
-                        )
-                    
-                    print(f"Saved {len(train_cams)} train and {len(test_cams)} test canonical renders")
-                
                 canonical_results = []
                 for viewpoint_cam in viewpoint_cams:
                     # canonical=True로 설정하여 deformation 미적용 렌더링
                     canonical_render = render(viewpoint_cam, gaussians, pipe, background, stage=stage, cam_type=scene.dataset_type, canonical=True)["render"]
+                    
+                    # CRITICAL: Gradient 확인
+                    if not canonical_render.requires_grad:
+                        print(f"ERROR: canonical_render does not require grad!")
+                        print(f"  gaussians._xyz.requires_grad: {gaussians._xyz.requires_grad}")
+                        print(f"  gaussians._scaling.requires_grad: {gaussians._scaling.requires_grad}")
+                        print(f"  gaussians._rotation.requires_grad: {gaussians._rotation.requires_grad}")
+                        raise ValueError("Canonical render lost gradient!")
+                    
                     # 중요: 이미지를 [0, 1] 범위로 클램핑
                     canonical_render = torch.clamp(canonical_render, 0.0, 1.0)
                     canonical_results.append(canonical_render.unsqueeze(0))
                 
                 canonical_image_tensor = torch.cat(canonical_results, 0)
-                
-                # # Canonical 렌더링 결과 저장 (1000 iteration마다)
-                # if iteration % 1000 == 0:
-                #     canonical_save_path = os.path.join(scene.model_path, "canonical_sds_samples", f"iter_{iteration}")
-                #     os.makedirs(canonical_save_path, exist_ok=True)
-                #     for idx, img in enumerate(canonical_results):
-                #         torchvision.utils.save_image(
-                #             img, 
-                #             os.path.join(canonical_save_path, f"cam_{idx}.png")
-                #         )
                 
                 # 렌더링된 이미지 형태 확인 및 필요시 크기 조정
                 rendered_image = canonical_image_tensor.clone()
@@ -317,39 +285,55 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
                 # 다시 한번 [0, 1] 범위로 클램핑 (안전을 위해)
                 rendered_image = torch.clamp(rendered_image, 0.0, 1.0)
                 
+                # CRITICAL: 최종 gradient 확인
+                if not rendered_image.requires_grad:
+                    print(f"ERROR: rendered_image lost gradient before SDS!")
+                    raise ValueError("Lost gradient before SDS calculation!")
+                
                 # 일반적으로 SD는 512x512 또는 768x768 이미지를 사용
                 # 필요시 리사이즈
                 orig_size = rendered_image.shape[-2:]
                 if orig_size != (512, 512):
                     rendered_image = F.interpolate(rendered_image, size=(512, 512), mode='bilinear', align_corners=False)
-                
-                # 배치 처리를 위한 준비
-                # print(f"SDS 계산을 위한 이미지 배치 크기: {rendered_image.shape[0]}")
+                    
+                    # 리사이즈 후 gradient 확인
+                    if not rendered_image.requires_grad:
+                        print(f"ERROR: rendered_image lost gradient after resize!")
+                        raise ValueError("Lost gradient after resize!")
                 
                 # SD 모델에서 기대하는 프롬프트 형식 준비
-                # 각 이미지마다 동일한 프롬프트 사용
                 prompts = [opt.sds_prompt] * rendered_image.shape[0]
                 negative_prompts = [opt.sds_negative_prompt] * rendered_image.shape[0]
+                
+                print(f"[DEBUG] Before SDS call - rendered_image.requires_grad: {rendered_image.requires_grad}")
                 
                 # SDS loss 계산
                 sds_loss = sds_loss_fn(
                     rendered_image, 
-                    prompts,  # 배치의 각 이미지에 대한 프롬프트 리스트 전달
-                    negative_prompts  # 배치의 각 이미지에 대한 부정 프롬프트 리스트 전달
+                    prompts,
+                    negative_prompts
                 )
-                loss_sds = opt.sds_weight * sds_loss
+                
+                print(f"[DEBUG] After SDS call - sds_loss.requires_grad: {sds_loss.requires_grad}")
+                
+                if not sds_loss.requires_grad:
+                    print(f"ERROR: SDS loss does not require grad!")
+                    loss_sds = None
+                else:
+                    loss_sds = opt.sds_weight * sds_loss
+                    print(f"[DEBUG] Final loss_sds.requires_grad: {loss_sds.requires_grad}")
                 
                 # Tensorboard에 SDS loss 로깅
-                if tb_writer:
+                if tb_writer and loss_sds is not None:
                     tb_writer.add_scalar(f'{stage}/train_loss_patches/sds_loss', sds_loss.item(), iteration)
             
             except Exception as e:
                 print(f"SDS Loss 계산 중 오류 발생: {e}")
-                print(f"렌더링 이미지 범위: 최소={rendered_image.min()}, 최대={rendered_image.max()}")
-                print(f"렌더링 이미지 크기: {rendered_image.shape}")
+                import traceback
+                traceback.print_exc()
                 loss_sds = None
-                # 오류가 발생해도 학습은 계속 진행
-                pass
+
+
         if current_iter_uses_sds:
             # SDS iteration에서는 reconstruction loss 비중 줄이기
             loss = loss_sds
@@ -363,9 +347,18 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
         if torch.isnan(loss).any():
             print("loss is nan,end training, reexecv program now.")
             os.execv(sys.executable, [sys.executable] + sys.argv)
+
+        # viewspace_point_tensor gradient 처리 - None 체크 추가
         viewspace_point_tensor_grad = torch.zeros_like(viewspace_point_tensor)
         for idx in range(0, len(viewspace_point_tensor_list)):
-            viewspace_point_tensor_grad = viewspace_point_tensor_grad + viewspace_point_tensor_list[idx].grad
+            # gradient가 None이 아닌 경우에만 더하기
+            if viewspace_point_tensor_list[idx].grad is not None:
+                viewspace_point_tensor_grad = viewspace_point_tensor_grad + viewspace_point_tensor_list[idx].grad
+            else:
+                print(f"Warning: viewspace_point_tensor_list[{idx}].grad is None at iteration {iteration}")
+                # SDS iteration에서는 viewspace gradient가 없을 수 있으므로 경고만 출력
+
+
         iter_end.record()
 
         with torch.no_grad():

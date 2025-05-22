@@ -82,10 +82,20 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     deformation_point = pc._deformation_table
     
     
-    # 주요 변경 부분: canonical 모드 추가
-    if canonical:
+    # 주요 변경 부분: canonical 모드 추가 -> grad 오류
+    # if canonical:
         # Canonical 렌더링: 변형(deformation) 미적용
-        means3D_final, scales_final, rotations_final, opacity_final, shs_final = means3D, scales, rotations, opacity, shs
+        # means3D_final, scales_final, rotations_final, opacity_final, shs_final = means3D, scales, rotations, opacity, shs
+    
+    # 수정된 부분: canonical 모드에서도 gradient 유지
+    if canonical:
+        # Canonical 렌더링: 변형(deformation) 미적용하되 gradient는 유지
+        # 원본 파라미터들을 그대로 사용하되, clone()을 통해 gradient graph 유지
+        means3D_final = means3D.clone()
+        scales_final = scales.clone() if scales is not None else None
+        rotations_final = rotations.clone() if rotations is not None else None
+        opacity_final = opacity.clone()
+        shs_final = shs.clone()
     elif "coarse" in stage:
         means3D_final, scales_final, rotations_final, opacity_final, shs_final = means3D, scales, rotations, opacity, shs
     elif "fine" in stage:
